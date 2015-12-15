@@ -8,7 +8,6 @@ import numpy as np
 from numpy import fft
 # import pyfftw
 import UtilityFunctions
-import json
 import os
 import h5py
 import pint
@@ -341,7 +340,8 @@ class GPESolver(object):
     """
     # Strictly speaking, Pth is not required, but we will pass the output of
     # ParameterContainer.getGPEParams, so it will be present.
-    __requiredParams = ['g_C', 'gamma_C'', Pth', 'k', 'charL', 'charT']
+    __requiredParams = ['R', 'g_C', 'g_R', 'gamma_C', 'gamma_R', 'Pth', 'k',
+                        'charL', 'charT']
     __stepsPerTimePrint = 1e3
 
     def __init__(self, paramContainer, dt, grid, pumpFunction=None,
@@ -403,7 +403,8 @@ class GPESolver(object):
             if key not in params:
                 raise ValueError("Required Parameter %s missing" % key)
             self.__setattr__(key, params[key])
-
+        if self.singleComp:
+            self.gamma_nl = params["gamma_nl"]
         self.max_XY_scaled = self.max_XY * self.charL
         # Create arrays for damping, etc.
         if damping == 'default':
@@ -429,7 +430,7 @@ class GPESolver(object):
 
         if self.singleComp:
             expFactorPolSecond = - (self.gamma_nl + 1j * self.g_C) * self.dt
-            n = self.Pdt / (self.dt * self.gamma_R)
+            n = Pdt / (self.dt * self.gamma_R)
         else:
             expFactorPolSecond = - 1j * self.g_C * self.dt
             n = np.zeros_like(psi0, dtype=np.float64)
@@ -448,9 +449,6 @@ class GPESolver(object):
         self.currentDensity = gpuarray.to_gpu(currentDensity
                                               .astype(REAL_DTYPE))
         self.Pdt = gpuarray.to_gpu(Pdt.astype(REAL_DTYPE))
-        self.gammaRdt = gpuarray.to_gpu(np.array(gammaRdt)
-                                        .astype(REAL_DTYPE))
-        self.Rdt = gpuarray.to_gpu(np.array(Rdt).astype(REAL_DTYPE))
         self.expFactorPolFirst = gpuarray.to_gpu(
             np.array([expFactorPolFirst]).astype(COMPLEX_DTYPE))
         self.expFactorPolSecond = gpuarray.to_gpu(
@@ -472,7 +470,8 @@ class GPESolver(object):
         self.step_gpu()
         self.nSteps += 1
         self.time += self.dt
-        if printTime and (self.nSteps % self.__class__.__stepsPerTimePrint == 0):
+        if printTime and\
+                (self.nSteps % self.__class__.__stepsPerTimePrint == 0):
             print("Time = %f" % self.time)
 
     def step_gpu(self):
@@ -556,7 +555,7 @@ class GPESolver(object):
                                  with t_max")
             if spectStart < self.time:
                 raise ValueError("Spectrum start time is before current time")
-            spectMax = self.N if spectMax == None else spectMax
+            spectMax = self.N if not spectMax else spectMax
             self.numSpectObs = spectLength // self.dt
             # StartStep and EndStep are the first and last steps during which a
             # spectrum slice will be recorded.
@@ -568,24 +567,35 @@ class GPESolver(object):
                                                           2*spectMax),
                                                          dtype=self.psi.dtype))
             self.omega_axis = np.linspace(-self.numSpectObs / 2.0,
-                                      self.numSpectObs / 2.0 - 1,
-                                        num=self.numSpectObs) *\
+                                          self.numSpectObs / 2.0 - 1,
+                                          num=self.numSpectObs) *\
                 2*np.pi / (self.numSpectObs * self.dt)
             spectStep = 0
 
         for step in xrange(N_TIMESTEPS):
             self.step(printTime=printTime)
-            if (recordEnergy or recordNumber)\
-                    and step % stepsPerObservation == 0:
+            if recordEnergy and step % stepsPerObservation == 0:
+                self.energy[self.numObservations] = \
+                    self.getEnergy(normalized=normalized, mask=collectionMask)
+            if recordNumber and step % stepsPerObservation == 0:
+                self.number[self.numObservations] = \
+                    self.getTotalNumber(mask=collectionMask)
+            if (recordEnergy or recordNumber) and\
+                         step % stepsPerObservation == 0:
                 self.times[self.numObservations] = self.time
-                if recordEnergy:
-                    self.energy[self.numObservations] = \
-                        self.getEnergy(normalized=normalized,
-                                       mask=collectionMask)
-                if recordNumber:
-                    self.number[self.numObservations] =\
-                        self.getTotalNumber(mask=collectionMask)
                 self.numObservations += 1
+
+            # if (recordEnergy or recordNumber) and\
+            #         step % stepsPerObservation == 0:
+            #     self.times[self.numObservations] = self.time
+            #     if recordEnergy:
+            #         self.energy[self.numObservations] = \
+            #             self.getEnergy(normalized=normalized,
+            #                            mask=collectionMask)
+            #     if recordNumber:
+            #         self.number[self.numObservations] =\
+            #             self.getTotalNumber(mask=collectionMask)
+            #     self.numObservations += 1
             if recordSpectrum and step >= self.spectStartStep\
                     and step <= self.spectEndStep:
                 # Note that we need to copy into the spectrum array in reverse
@@ -679,8 +689,10 @@ class GPESolver(object):
         f = h5py.File(fName + ".hdf5", "w")
         f.create_dataset("psi", data=self.psi.get().astype(np.complex64))
         f.create_dataset("n", data=self.n.get().astype(np.float32))
-        f.create_dataset("x_ax", data=self.grid.x_axis_scaled.astype(np.float32))
-        f.create_dataset("k_ax", data=self.grid.k_axis_scaled.astype(np.float32))
+        f.create_dataset("x_ax",
+                         data=self.grid.x_axis_scaled.astype(np.float32))
+        f.create_dataset("k_ax",
+                         data=self.grid.k_axis_scaled.astype(np.float32))
         f.create_dataset("Pdt", data=self.Pdt.get().astype(np.float32))
         if hasattr(self, "energy"):
             f.create_dataset("energy", data=self.energy.astype(np.float32))
@@ -689,8 +701,10 @@ class GPESolver(object):
         if hasattr(self, "times"):
             f.create_dataset("times", data=self.times.astype(np.float32))
         if hasattr(self, "spectrum"):
-            f.create_dataset("spectrum", data=self.spectrum.astype(np.complex64))
-            f.create_dataset("omega_axis", data=self.omega_axis.astype(np.float32))
+            f.create_dataset("spectrum",
+                             data=self.spectrum.astype(np.complex64))
+            f.create_dataset("omega_axis",
+                             data=self.omega_axis.astype(np.float32))
 
         # paramsToSave = ['R', 'g_C', 'g_R', 'gamma_C', 'gamma_R', 'm', 'charT',
         #                 'charL']
@@ -702,37 +716,12 @@ class GPESolver(object):
         f.close()
 
 # TODO: Provide a potential function?
+
+
 class GPESolverSingle(GPESolver):
-    # def __init__(self, paramContainer, dt, grid, pumpFunction=None,
-    #              damping='default', psiInitial=None, FFTW_METHOD='fftw_patient',
-    #              N_THREADS=6, gpu=True, REAL_DTYPE=np.float32,
-    #              COMPLEX_DTYPE=np.complex64):
-    #     GPESolver.__init__(self, paramContainer, dt, grid, pumpFunction=none,
-    #                        damping='default', psiInitial=none,
-    #                        FFTW_METHOD='fftw_patient', N_THREADS=6, gpu=true,
-    #                        REAL_DTYPE=np.float32, COMPLEX_DTYPE=np.complex64)
-
-    #     hbar = UnitRegistry().hbar.to_base_units().magnitude
-    #     self.gamma_nl = params['gamma_nl']
-    #     self.gamma_eff = params['gamma_eff']
-    #     # Fix the polariton exponential factors and potential
-    #     expFactorPolFirst = self.dt * (self.g_C - 1j*self.gamma_nl)
-    #     expFactorPolSecond = self.gamma_eff * self.dt
-    #     # Note that here we need the unscaled parameters
-    #     Vdt = ((hbar * params.g_R)
-    #                    / (params.charT * params.gamma_R)) * self.Pdt.get()
-    #     if self.gpu:
-    #         self.expFactorPolFirst = gpuarray.to_gpu(
-    #             np.array([expFactorPolFirst]).astype(COMPLEX_DTYPE))
-    #         self.expFactorPolSecond = gpuarray.to_gpu(
-    #             np.array([expFactorPolSecond]).astype(COMPLEX_DTYPE))
-    #         self.expFactorPolThird = gpuarray.to_gpu(
-    #             np.array([expFactorPolThird]).astype(COMPLEX_DTYPE))
-    #         self.Vdt = gpuarray.to_gpu(Vdt.astype(REAL_DTYPE))
-
     def __init__(self, paramContainer, dt, grid, potentialFunction=None,
                  damping='default', psiInitial=None, gpu=True,
-                 real_dtype=np.float32, complex_dtype=np.complex64):
+                 REAL_DTYPE=np.float32, COMPLEX_DTYPE=np.complex64):
         """
         Initialise an instance of a GPESolver.
 
@@ -773,7 +762,6 @@ class GPESolverSingle(GPESolver):
         # This is already scaled because we obtained it from the scaled grid.
         self.max_XY = np.abs(self.x[-1, -1])
         self.N = int(self.x.shape[0])
-        self.N_THREADS = N_THREADS
         self.dt = dt
         self.time = 0
         self.nSteps = 0
@@ -790,7 +778,7 @@ class GPESolverSingle(GPESolver):
         #     self.__setattr__(key, params[key])
 
         # Assign parameters
-        for key, value in prams.iteritems():
+        for key, value in params.iteritems():
             self.__setattr(key, value)
 
         self.max_XY_scaled = self.max_XY * self.charL
@@ -809,6 +797,7 @@ class GPESolverSingle(GPESolver):
                                             scale=10e-4, loc=10e-3))
         else:
             psi0 = psiInitial(self.x, self.y) + 0j
+        n = np.zeros_like(psi0, dtype=np.float64)
         currentDensity = np.absolute(psi0) ** 2
         if not potentialFunction:
             potentialFunction = lambda x, y: np.zeros_like(x)
@@ -909,7 +898,6 @@ class GPESolverSingle(GPESolver):
             - (self.g_C * density + V)
             * density), mask=mask).sum() / normFactor
 
-
     def save(self, fName, **kwargs):
         """
         Saves the relevant parts of the solver as an hdf5 file.
@@ -923,8 +911,10 @@ class GPESolverSingle(GPESolver):
         f = h5py.File(fName + ".hdf5", "w")
         f.create_dataset("psi", data=self.psi.get().astype(np.complex64))
         f.create_dataset("n", data=self.n.get().astype(np.float32))
-        f.create_dataset("x_ax", data=self.grid.x_axis_scaled.astype(np.float32))
-        f.create_dataset("k_ax", data=self.grid.k_axis_scaled.astype(np.float32))
+        f.create_dataset("x_ax",
+                         data=self.grid.x_axis_scaled.astype(np.float32))
+        f.create_dataset("k_ax",
+                         data=self.grid.k_axis_scaled.astype(np.float32))
         f.create_dataset("Vdt", data=self.Vdt.get().astype(np.float32))
         if hasattr(self, "energy"):
             f.create_dataset("energy", data=self.energy.astype(np.float32))
@@ -933,8 +923,10 @@ class GPESolverSingle(GPESolver):
         if hasattr(self, "times"):
             f.create_dataset("times", data=self.times.astype(np.float32))
         if hasattr(self, "spectrum"):
-            f.create_dataset("spectrum", data=self.spectrum.astype(np.complex64))
-            f.create_dataset("omega_axis", data=self.omega_axis.astype(np.float32))
+            f.create_dataset("spectrum",
+                             data=self.spectrum.astype(np.complex64))
+            f.create_dataset("omega_axis",
+                             data=self.omega_axis.astype(np.float32))
 
         # paramsToSave = ['R', 'g_C', 'g_R', 'gamma_C', 'gamma_R', 'm', 'charT',
         #                 'charL']

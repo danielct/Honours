@@ -156,7 +156,7 @@ def runIt(g_C, R, gamma_C, a, width, diffusionLength, rMiddle, P):
                                  REAL_DTYPE=np.float64,
                                  COMPLEX_DTYPE=np.complex128)
     solver.stepTo(T_MAX, stepsPerObservation=1000, spectStart=T_STABLE,
-                  normalized=False, spectLength=spectLength, printTime=True,
+                  normalized=False, spectLength=spectLength, printTime=False,
                   collectionMask=mask, spectMax=spectMax)
     f = diagnosticPlot(solver)
     f.savefig("PScanSingle " + getPlotName(ringParams, P=P) + ".png", dpi=500)
