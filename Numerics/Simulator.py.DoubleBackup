@@ -1,0 +1,894 @@
+"""
+Module that contains classes used to model the coupled GPE using split-step
+fourier method
+"""
+from __future__ import division
+from math import floor
+import numpy as np
+from numpy import fft
+# import pyfftw
+import UtilityFunctions
+import json
+import os
+import h5py
+import pint
+import pycuda.autoinit
+import pycuda.gpuarray as gpuarray
+import skcuda.fft as cu_fft
+import pycuda.driver as drv
+
+# TODO: Or use a better units package
+
+WISDOM_LOCATION = os.path.join(os.path.expanduser('~'), '.wisdom', 'wisdom')
+
+
+class ParameterContainer(object):
+    """
+    This class serves as a container for the values of the parameters used in an
+    experiment, and provides access to the scaling factors.
+    """
+    __requiredArgs = ['R', 'g_C', 'g_R', 'gamma_C', 'gamma_R', 'm']
+    __allowedArgs = ['R', 'g_C', 'g_R', 'gamma_R', 'gamma_C', 'm', 'charT',
+                     'charL', 'k']
+    __outArgs = ['R', 'g_C', 'g_R', 'gamma_C', 'gamma_R', 'Pth', 'charL',
+                 'charT']
+    ur = pint.UnitRegistry()
+    __m_e = ur.electron_mass.to_base_units().magnitude
+    __hbar = ur.hbar.to_base_units().magnitude
+
+    def __init__(self, **kwargs):
+        """
+        Initialises all the parameters and computes the scaling factors.
+        All parameters should be pint Quantities.
+
+        :Parameters:
+            **kwargs:
+                The following are all required:
+                    R : Stimulated scattering rate
+                    g_C : Polariton-polariton interaction strength
+                    g_R:
+                    gamma_C : Polariton relaxation rate
+                    gamma_R
+                    m : Polariton effective mass, in units of the electron mass
+                The following are optional:
+                    k: Value of dispersive coefficient. If not provided, defaults
+                    to hbar**2 / (2 * m)
+                    charT: a characteristic time to scale by. If not provded,
+                    defaults to (gamma_C) ^ -1
+                    charL: a charactersitic length to scale by. If not provided,
+                    defaults to ( hbar * charT / (2 * m * gamma_C) )^1/2.
+        """
+        self.__checkArgs(kwargs)
+
+        # Define the output units and actual units of the parameters
+        # We'll make them strings to make life easy, and because we want them to
+        # be reported int the right way
+        self.ureg = pint.UnitRegistry()
+        self.gOutput = "millieV * micrometer**2"
+        self.rOutput = "millieV * micrometer**2 * hbar**-1"
+        self.gammaOutput = "picosecond ** -1"
+        self.mOutput = "electron_mass"
+        self.charLOutput = "micrometer"
+        self.charTOutput = "picosecond"
+        self.mBase = "gram"
+        self.gBase = "gram * meter **4 * second ** -2"
+        self.rBase = "meter**2 * second **-1"
+        self.gammaBase = "second ** -1"
+        self.charLBase = "meter"
+        self.charTBase = "second"
+
+        # Read in the keyword arguments
+        for (k, v) in kwargs.items():
+            assert k in self.__class__.__allowedArgs, "Invalid Argument %s" % k
+            setattr(self, k, v.to_base_units().magnitude)
+
+        # Set mass. We read in mass in units of electron mass for convenience,
+        # but it must be converted to SI units
+        # self.m_scaled = self.m
+        # self.m = self.__class__.__m_e * self.m
+
+        # m is now read in as a pint quantity. We don't need to scale it up by
+        # the electron mass, but we do need to find the scaled mass
+        self.m_scaled = self.m / self.__class__.__m_e
+        # Read in k or set to default
+        self.k = kwargs.get('k', self.__class__.__hbar**2 / (2 * self.m))
+
+        # Define our characteristic length, time, and energy scales.
+        # If t' is the (nondimensional) time variable used in the
+        # nondimensionalised GPE, then t = charT * t'. For example, R' is the
+        # stimulated scattering rate used in the normalised GPE, so R = charR *
+        # R'. If they are not provided, we will set them to the default, which
+        # is the scaling that makes k=1 and gamma'_C = 1.
+
+        self.charT = kwargs.get('charT', 1.0 / self.gamma_C)
+        if 'charT' in kwargs.keys():
+            self.charT = self.charT.to_base_units().magnitude
+        self.charL = kwargs.get('charL', np.sqrt((self.__class__.__hbar
+                                                  * self.charT)
+                                                 / (2.0 * self.m)))
+        if 'charL' in kwargs.keys():
+            self.charL = self.charL.to_base_units().magnitude
+        # A characteristic energy
+        self.charU = self.__class__.__hbar / self.charT
+        self.charg = (self.__class__.__hbar * self.charL**2) / self.charT
+        self.charR = self.charL ** 2 / self.charT
+        self.charGamma = 1.0 / self.charT
+        # TODO: Check
+        self.chark = (self.__class__.__hbar * self.charL**2) / self.charT
+        # This may not be required - the P term in the GPE is phenomonological,
+        # and the experimentalist probably only knows it in terms of Pth
+        self.charP = 1.0 / (self.charT * self.charL ** 2)
+        self.charE = self.__class__.__hbar / self.charT
+
+        # Scaled parameters - these are the ones to used in the
+        # nondimensionalised GPE
+        self.g_C_scaled = self.g_C / self.charg
+        self.g_R_scaled = self.g_R / self.charg
+        self.gamma_C_scaled = self.gamma_C / self.charGamma
+        self.gamma_R_scaled = self.gamma_R / self.charGamma
+        self.k_scaled = self.k / self.chark
+        self.R_scaled = self.R / self.charR
+        # Compute threshold pump power for the normalised GPE.
+        self.Pth_scaled = ((self.gamma_R_scaled * self.gamma_C_scaled)
+                           / self.R_scaled)
+        # Compute threshold pump power for unnormalised GPE. We can get this
+        # from the scaled one.
+        self.Pth = self.charP * self.Pth_scaled
+
+    # TODO: FIX
+    # def update(self, **kwargs):
+    #     """
+    #     Updates the parameters given in keyword arguments and recomputes the
+    #     scaling factors.
+
+    #     Care must be taken when using this function, as it does not respect
+    #     the way in which parameters were originally defined. For example, if
+    #     g_C and r were initially provided, updating g_C will *not* cause g_R
+    #     to be updated. If g_C and g_R were originally provided, and r is
+    #      updated, g_R will be updated to r * g_C
+
+    #     :Parameters:
+    #         **kwargs:
+    #             May contain any of the keyword arguments allowed in __init__,
+    #             subject to the consistency requirements concerning g_R and r,
+    #             and gamma_R and s.
+
+    #     """
+    #     # Get the new values of the required arguments. We do this by copying
+    #     # the current values of the required arguments into a dictionary,
+    #     # an then updating from/adding the keyword arguments, and then using
+    #     # these to initialise again.
+
+    #     # Add required arguments and their current values to our new keyword
+    #     # arguments.
+    #     newkwArgs = {k: self.__dict__.get(k)
+    #                  for k in self.__class__.__requiredArgs}
+    #     # Update required arguments and add keyword arguments that were just
+    #     # provided
+    #     for (k, v) in kwargs.items():
+    #         newkwArgs[k] = v
+    #     # There's no need to check that all the required arguments are present
+    #     # as we already had them.
+    #     # Check consistency here, so that the trace will be cleaner if an
+    #     # exception is raised.
+    #     self.__checkArgs(newkwArgs)
+    #     self.__init__(newkwArgs)
+
+    def __checkArgs(self, kwargs):
+        """
+        Checks the consistency and validity of the keyword arguments. Raises
+        errors if the system is not completely specified, or if unrecognised
+        arguments are provided.
+        """
+        for arg in self.__class__.__requiredArgs:
+            if arg not in kwargs:
+                raise ValueError("Essential keyword argument %s missing" % arg)
+        for (k, v) in kwargs.items():
+            assert k in self.__class__.__allowedArgs, "Invalid Argument %s" % k
+
+
+    def getGPEParams(self):
+        """
+        Returns a dictionary containing the parameters in the nondimensionalised
+        GPE, and a few other useful parameters, such as Pth. Mostly used for
+        calling GPESolver.
+
+        Returns:
+            A dictionary with the following keys and values for the
+            nondimensionalised GPE:
+                R : Stimulated scattering rate.
+                gamma_C : Polariton decay rate.
+                gamma_R : Exciton decay rate.
+                g_C : Polariton-polariton interaction strength.
+                g_R : Polariton-exciton interaction strength.
+                Pth : Threshold pump power.
+        """
+        outKeysScale = ['R', 'gamma_C', 'gamma_R', 'g_C', 'g_R', 'k', 'Pth']
+        outKeys = ['charL', 'charT']
+        out = {key: self.__dict__[key + "_scaled"] for key in outKeysScale}
+        for key in outKeys:
+            out[key] = self.__dict__[key]
+        return out
+
+    def getOutputParams(self):
+        """
+        Returns a dictionary with the GPE parameters in useful units. Doesn't
+        include g_R because it's always 2 * g_C
+        """
+        out = {}
+        out["g_C"] = self.ureg.Quantity(self.g_C, self.gBase).to(self.gOutput)
+        out["g_R"] = self.ureg.Quantity(self.g_R, self.gBase).to(self.gOutput)
+        out["R"] = self.ureg.Quantity(self.R, self.rBase).to(self.rOutput)
+        out["gamma_C"] = self.ureg.Quantity(self.gamma_C,
+                                            self.gammaBase).to(self.gammaOutput)
+        out["gamma_R"] = self.ureg.Quantity(self.gamma_R,
+                                            self.gammaBase).to(self.gammaOutput)
+        out["m"] = self.ureg.Quantity(self.m, self.mBase).to(self.mOutput)
+        out["charL"] = self.ureg.Quantity(self.charL,
+                                          self.charLBase).to(self.charLOutput)
+        out["charT"] = self.ureg.Quantity(self.charT,
+                                          self.charTBase).to(self.charTOutput)
+        return out
+
+
+class Grid(object):
+    """
+    A class that contains derived GPE parameters and uses them to create scaled
+    and unscaled grids.
+    """
+    # TODO: Allow us to provide a characteristic size in scaled units.
+    def __init__(self, charLength, max_XY, N=1024):
+        """
+        Initialise a grid, either of a particular size, or of a size large
+        enough to contain some object which is defined by a characteristic size.
+        We define grids internally only through one-dimensional arrays that
+        represent the axes. Spatials grids are returned by the getFooGrid
+        methods.
+
+        Parameters:
+            charLength: The characteristic length that will be used to obtain
+            the scaled grid. Typically obtained from a ParameterContainer
+            instance
+
+            N: Number of grid elements along each axis. The grid will be N * N.
+            Defaults to 1024
+
+            max_XY: the maximum spatial extent of the grid, a pint Quantity. If
+            provided, the grid will run from -max_XY to max_XY in both
+            dimensions.
+        """
+        # Check that N is a power of 2
+        if bin(N).rfind('1') != 2:
+            raise Warning("N is not a power of 2. FFTs may be slow!")
+        self.max_XY_unscaled = max_XY.to_base_units().magnitude
+        self.charL = charLength
+        self.N = N
+        self.max_XY_scaled = self.max_XY_unscaled / self.charL
+        # Unscaled grid. x and y values are in SI units.
+        self.x_axis_unscaled = np.linspace(- self.max_XY_unscaled,
+                                           self.max_XY_unscaled, num=N)
+        self.dx_unscaled = np.absolute(self.x_axis_unscaled[0]
+                                       - self.x_axis_unscaled[1])
+        self.dx_scaled = self.dx_unscaled / self.charL
+        # These must be fftshift'ed before making a grid
+        self.k_axis_unscaled = (((2.0 * np.pi) / (2.0 * self.max_XY_unscaled)) *
+                                np.linspace(-N/2, N/2 - 1, num=N))
+        # Grid in units of the characteristic length provided in params
+        self.x_axis_scaled = np.linspace(
+            -self.max_XY_scaled, self.max_XY_scaled, num=N)
+        self.k_axis_scaled = (((2.0 * np.pi) / (2.0 * self.max_XY_scaled)) *
+                              np.linspace(-N/2, N/2 - 1, num=N))
+
+    def getSpatialGrid(self, scaled=True):
+        """
+        Build and return a spatial grid.
+
+        parameters:
+            scaled: If False, the values of the grid will correspond to SI units
+            of length. If True, the values will be in units of self.charLength.
+        returns:
+            x, y: Arrays of x and y values corresponding to the grid
+        """
+        if scaled:
+            return np.meshgrid(self.x_axis_scaled, self.x_axis_scaled)
+        else:
+            return np.meshgrid(self.x_axis_unscaled, self.x_axis_unscaled)
+
+    def getkGrid(self, scaled=True):
+        """
+        Build and return a grid of k values.
+
+        parameters:
+            scaled: If False, the values of the grid will correspond to SI units
+            of 1 / length. If True, the values will be in units
+            of 1 / self.charLength.
+        Returns:
+            k_x, k_y: Arrays of k_x and k_y values corresponding to the grid
+        """
+        if scaled:
+            return np.meshgrid(fft.fftshift(self.k_axis_scaled),
+                               fft.fftshift(self.k_axis_scaled))
+        else:
+            return np.meshgrid(fft.fftshift(self.k_axis_unscaled),
+                               fft.fftshift(self.k_axis_scaled))
+
+    def getKSquaredGrid(self, scaled=True):
+        """
+        Build and return a grid of k_x^2 + k_y^2 values.
+
+        Parameters:
+           scaled: If False, the values of the grid will correspond to SI units
+           of 1 / length. If True, the values will be in units
+           of 1 / self.charLength.
+
+        Returns:
+            An array corresponding to the function k -> k_x^2 + k_y^2
+        """
+        kx, ky = self.getkGrid(scaled=scaled)
+        return kx ** 2 + ky ** 2
+
+    def toPixels(self, l, scaled=False):
+        """
+        Converts a length to pixels:
+
+        Parameters:
+            l: Length to convert. If the scaled is true, the length is in units
+            of charL. If not, it is in base units (the same as charL).
+            scaled: whether the length is in units of charL or not.
+
+        Returns:
+            The length in pixels (not rounded).
+        """
+        if scaled:
+            lScaled = l
+
+        else:
+            lScaled = l / self.charL
+        return lScaled / self.dx_scaled
+
+
+class GPESolver(object):
+    """
+    Class that solves an instance of the GPE and keeps some results.
+
+    The GPESolver object simply stores the grid and FFTW objects
+    that perform the FFTs. Its solve method
+    may be called many times with different pumps, potentials and initial
+    wavefunctions. This should result in a slight speed increase when many
+    experiments are performed as we can make fftw plans outside of the solve
+    method.
+
+    Calling the solve method causes the final condensate wavefunction and
+    resovoir density to be stored as attributes of the GPESolver.
+    """
+    # Strictly speaking, Pth is not required, but we will pass the output of
+    # ParameterContainer.getGPEParams, so it will be present.
+    __requiredParams = ['g_C', 'gamma_C'', Pth', 'k',
+                        'charL', 'charT']
+    __stepsPerTimePrint = 1e3
+
+    def __init__(self, paramcontainer, dt, grid, pumpfunction=none,
+                 damping='default', psiinitial=none, fftw_method='fftw_patient',
+                 n_threads=6, gpu=true, real_dtype=np.float32,
+                 complex_dtype=np.complex64):
+        """
+        Initialise an instance of a GPESolver.
+
+        Parameters:
+
+            spatialGrid: A tuple (x, y) representing the spatial grid that the
+            simulation will be performed on. This grid should be scaled to units
+            of the characteristic length defined in ParameterContainer.
+
+            kGrid: A tuple (k_x, k_y) representing the k-space grid
+            corresponding to the (x, y) grid. The scaling of this grid should
+            correspond to that of the (x, y) grid. That is, it should be scaled
+            to units of the inverse of the characterestic length defined in
+            ParameterContainer.
+
+            damping: The damping method to use in order to suppress the implicit
+            periodic boundary conditions. Default is a tanh function that
+            drops from 1.0 to 0 over the last 10% of each dimension. Presently,
+            the only other option is "None", which means no damping, and hence
+            periodic boundary conditions
+
+
+            FFTW_METHOD: The method for FFTW to use when planning the transforms
+            FFTW_PATIENT, FFTW_EXHAUSTIVE and FFTW_MEASURE will result in
+            faster transforms, but may take a significant amount of time to plan
+
+            N_THREADS: The number of threads for FFTW to use. Currently 2
+            threads seems to give the lowest time per step (8 core computer).
+            Increasing this may greatly increase the time that FFTW requires to
+            plan the transforms.
+        """
+
+        self.gpu = gpu
+        self.grid = grid
+        self.paramContainer = paramContainer
+        params = paramContainer.getGPEParams()
+        self.x, self.y = grid.getSpatialGrid()
+        self.dx_scaled = grid.dx_scaled
+        self.dx_unscaled = grid.dx_unscaled
+        self.K = grid.getKSquaredGrid()
+        # This is already scaled because we obtained it from the scaled grid.
+        self.max_XY = np.abs(self.x[-1, -1])
+        self.N = int(self.x.shape[0])
+        self.N_THREADS = N_THREADS
+        self.dt = dt
+        self.time = 0
+        self.nSteps = 0
+        assert self.x.shape == self.y.shape, "Spatial grids are not the same\
+               shape"
+        assert self.x.shape == self.K.shape, "Spatial grids are not the same\
+               shape as k grid"
+        assert self.x.shape == (self.N, self.N), 'Grid must be square.'
+
+        # Check we have the required parameters and assign them
+        for key in self.__class__.__requiredParams:
+            if key not in params:
+                raise ValueError("Required Parameter %s missing" % key)
+            self.__setattr__(key, params[key])
+
+        self.max_XY_scaled = self.max_XY * self.charL
+        # Create arrays for damping, etc.
+        if damping == 'default':
+            damping = UtilityFunctions.RadialTanhDamping(
+                self.max_XY, k=10.0).unscaledFunction()(self.x, self.y)
+        elif damping == 'rectangular':
+            damping = UtilityFunctions.RectangularTanhDamping(
+                self.max_XY, k=10).unscaledFunction()(self.x, self.y)
+        self.damping = damping
+        if not psiInitial:
+            psi0 = (np.abs(np.random.normal(size=(self.N, self.N),
+                                            scale=10e-5, loc=10e-4))
+                    + 0.0j*np.random.normal(size=(self.N, self.N),
+                                            scale=10e-4, loc=10e-3))
+        else:
+            psi0 = psiInitial(self.x, self.y) + 0j
+        n = np.zeros_like(psi0, dtype=np.float64)
+        currentDensity = np.absolute(psi0) ** 2
+        if not pumpFunction:
+            pumpFunction = lambda x, y: np.zeros_like(x)
+        Pdt = pumpFunction(self.x, self.y) * self.dt
+        gammaRdt = self.gamma_R * self.dt
+        Rdt = self.R * self.dt
+        expFactorPolFirst = self.dt * (0.5 * self.R - 1j * self.g_R)
+        # TODO Check
+        expFactorPolSecond = - 1j * self.g_C * self.dt
+        expFactorPolThird = -0.5 * self.gamma_C * self.dt
+        # expFactorExciton = np.zeros_like(n)
+        kineticFactorHalf = np.exp(-1.0j * self.k * self.K * self.dt / 2.0)
+
+        if not self.gpu:
+            from numpy import exp
+            self.exp = exp
+            try:
+                wisdomFile = open(WISDOM_LOCATION, 'r+')
+                importStatus = pyfftw.import_wisdom(json.load(wisdomFile))
+                print "Wisdom found"
+                if not np.array(importStatus).all():
+                    print "Wisdom not loaded correctly"
+                    # raise Warning("Wisdom not loaded correctly.")
+                    wisdomFile.close()
+            except IOError:
+                print "Wisdom not present"
+                # Set up fftw objects
+                # Optimal alignment for this CPU
+            self.al = pyfftw.simd_alignment
+            self.psi = pyfftw.n_byte_align_empty((self.N, self.N), self.al,
+                                                 'complex128')
+            flag = FFTW_METHOD
+            self.fft_object = pyfftw.FFTW(self.psi, self.psi, flags=[flag],
+                                          axes=(0, 1), threads=N_THREADS)
+            self.ifft_object = pyfftw.FFTW(self.psi, self.psi, flags=[flag],
+                                           axes=(0, 1), threads=N_THREADS,
+                                           direction='FFTW_BACKWARD')
+            # Save pyfftw's newfound wisdom
+            f = open(WISDOM_LOCATION, 'w+')
+            json.dump(pyfftw.export_wisdom(), f)
+            f.close()
+            # Check psi is aligned
+            assert pyfftw.is_n_byte_aligned(self.psi, self.al)
+            # Carefully copy psi0 into psi. We want to be certain that we
+            # keep the alignment
+            self.psi[:] = 1
+            self.psi *= psi0
+
+            self.damping = damping.astype(REAL_DTYPE)
+            self.n = n.astype(REAL_DTYPE)
+            self.currentDensity = currentDensity.astype(REAL_DTYPE)
+            self.Pdt = Pdt.astype(REAL_DTYPE)
+            self.gammaRdt = gammaRdt.astype(REAL_DTYPE)
+            self.Rdt = Rdt.astype(COMPLEX_DTYPE)
+            self.expFactorPolFirst = expFactorPolFirst.astype(COMPLEX_DTYPE)
+            self.expFactorPolSecond = expFactorPolSecond.astype(COMPLEX_DTYPE)
+            self.expFactorPolThird = expFactorPolThird.astype(COMPLEX_DTYPE)
+            self.kineticFactorHalf = kineticFactorHalf.astype(COMPLEX_DTYPE)
+            # self.expFactorExciton = expFactorExciton
+
+        else:
+            from skcuda.misc import add, multiply
+            from pycuda.cumath import exp
+            self.add = add
+            self.multiply = multiply
+            self.exp = exp
+            self.cu_fft = cu_fft
+
+            self.damping = gpuarray.to_gpu(damping.astype(REAL_DTYPE))
+            self.psi = gpuarray.to_gpu(psi0.astype(COMPLEX_DTYPE))
+            self.n = gpuarray.to_gpu(n.astype(REAL_DTYPE))
+            self.currentDensity = gpuarray.to_gpu(currentDensity
+                                                  .astype(REAL_DTYPE))
+            self.Pdt = gpuarray.to_gpu(Pdt.astype(REAL_DTYPE))
+            self.gammaRdt = gpuarray.to_gpu(np.array(gammaRdt)
+                                            .astype(REAL_DTYPE))
+            self.Rdt = gpuarray.to_gpu(np.array(Rdt).astype(REAL_DTYPE))
+            self.expFactorPolFirst = gpuarray.to_gpu(
+                np.array([expFactorPolFirst]).astype(COMPLEX_DTYPE))
+            self.expFactorPolSecond = gpuarray.to_gpu(
+                np.array([expFactorPolSecond]).astype(COMPLEX_DTYPE))
+            self.expFactorPolThird = gpuarray.to_gpu(
+                np.array([expFactorPolThird]).astype(COMPLEX_DTYPE))
+            self.kineticFactorHalf = gpuarray.to_gpu(
+                np.array([kineticFactorHalf]).astype(COMPLEX_DTYPE))
+            # self.expFactorExciton = gpuarray.to_gpu(expFactorExciton)
+            self.plan_forward = cu_fft.Plan((self.N, self.N), COMPLEX_DTYPE,
+                                            COMPLEX_DTYPE)
+            self.plan_inverse = cu_fft.Plan((self.N, self.N), COMPLEX_DTYPE,
+                                            COMPLEX_DTYPE)
+
+    def step(self, printTime=False):
+        """
+        Make a single timestep.
+        """
+        if self.gpu:
+            self.step_gpu()
+        else:
+            self.step_cpu()
+
+        self.nSteps += 1
+        self.time += self.dt
+        if printTime and (self.nSteps % self.__class__.__stepsPerTimePrint == 0):
+            print("Time = %f" % self.time)
+
+    def step_cpu(self):
+        """
+        Make a single timestep.
+        """
+        # Take fft, multiply by kinetic factor and then take inverse fft
+        self.fft_object()
+        self.psi *= self.kineticFactorHalf
+        self.ifft_object()
+
+        self.currentDensity = (self.psi * self.psi.conj()).real
+
+        # TODO Check the second minus sign in the line below
+        self.n *= self.exp(-self.gammaRdt - (self.Rdt * self.currentDensity))
+        self.n += self.Pdt
+
+        # Do the nonlinear update, take FFT, do kinetic update, and then
+        # take the inverse fft
+        self.psi *= self.exp(self.expFactorPolFirst * self.n
+                             + self.expFactorPolSecond * self.currentDensity
+                             + self.expFactorPolThird)
+        self.fft_object()
+        self.psi *= self.kineticFactorHalf
+        self.ifft_object()
+
+        self.psi *= self.damping
+        self.n *= self.damping
+
+    def step_gpu(self):
+        self.cu_fft.fft(self.psi, self.psi, self.plan_forward)
+        self.psi *= self.kineticFactorHalf
+        self.cu_fft.ifft(self.psi, self.psi, self.plan_inverse, scale=True)
+
+        # currentDensity_gpu = abs(psi_gpu) ** 2
+        self.currentDensity = (self.psi * self.psi.conj()).real
+
+        # expFactorExciton_gpu = cumath.exp(-gammaRdt_gpu +
+        #                                   (Rdt_gpu * currentDensity_gpu))
+
+        # # TODO: Don't bother creating the intermediate? Write this as a single
+        # # pycuda elementwise kernel
+        # n_gpu *= cumath.exp(-gammaRdt_gpu + Rdt_gpu * currentDensity_gpu)
+        self.n *= self.exp(self.add(- self.gammaRdt,
+                                    - self.multiply(self.Rdt,
+                                                    self.currentDensity)))
+        self.n += self.Pdt
+
+        self.psi *= self.exp(
+            self.add(
+                self.add(self.multiply(self.expFactorPolFirst, self.n),
+                         self.multiply(self.expFactorPolSecond,
+                                       self.currentDensity)),
+                self.expFactorPolThird))
+
+        # self.psi *= self.exp(self.expFactorPolFirst * self.n
+        #                      + self.expFactorPolSecond*self.currentDensity
+        #                      + self.expFactorPolThird)
+
+        self.cu_fft.fft(self.psi, self.psi, self.plan_forward)
+        self.psi *= self.kineticFactorHalf
+        self.cu_fft.ifft(self.psi, self.psi, self.plan_inverse, scale=True)
+
+        self.psi *= self.damping
+        self.n *= self.damping
+
+    def stepTo(self, t_max, recordEnergy=True, normalized=True,
+               recordNumber=True, stepsPerObservation=100, printTime=False,
+               recordSpectrum=True, collectionMask=None, spectStart=50,
+               spectLength=50, spectMax=None):
+        """
+        Step until t is t_max.
+
+        Parameters:
+            t_max: Time to step to. When stepping is finished, time will be
+            within dt of t_max
+            recordEnergy: Flag to turn on energy recording.
+            recordNumber: Flag to turn on recording of total number.
+            stepsPerObservation: Number of steps between each energy observation
+            energyMask: Mask array to collect energy data from a subset of the
+            integration region.
+            spectMax: index used to collect spectral data from a subset of the
+            integration region. If not None, slices will be collected from
+            the slice [N/2 - spectMax, N/2 + spectMax]. Defaults to N/2 so that
+            by default the entire integration region is collected.
+        Returns:
+                None
+        """
+        # Spectrums can only be recorded along a horizontal slice. Defaults to
+        # middle. It's not clear if it will be ahrd to record along vertical.
+        N_TIMESTEPS = int(floor((t_max - self.time) // self.dt))
+        # Initialize arrays for observation times and observations.
+        if recordEnergy:
+            self.energy = np.zeros(int(floor((N_TIMESTEPS
+                                              // stepsPerObservation))) + 1)
+            self.times = np.zeros_like(self.energy)
+            self.numObservations = 0
+        if recordNumber:
+            self.number = np.zeros(int(floor((N_TIMESTEPS
+                                              // stepsPerObservation))) + 1)
+            self.times = np.zeros_like(self.number)
+            self.numObservations = 0
+        if recordSpectrum:
+            if spectStart + spectLength > t_max:
+                raise ValueError("Spectrum parameters not compatible\
+                                 with t_max")
+            if spectStart < self.time:
+                raise ValueError("Spectrum start time is before current time")
+            spectMax = self.N if spectMax == None else spectMax
+            self.numSpectObs = spectLength // self.dt
+            # StartStep and EndStep are the first and last steps during which a
+            # spectrum slice will be recorded.
+            self.spectStartStep = spectStart // self.dt
+            self.spectEndStep = self.spectStartStep + self.numSpectObs - 1
+            # This array stores slices (along the second axis) for different
+            # times (along the first axis)
+            self.spectrum_gpu = gpuarray.to_gpu(np.zeros((self.numSpectObs,
+                                                          2*spectMax),
+                                                         dtype=self.psi.dtype))
+            self.omega_axis = np.linspace(-self.numSpectObs / 2.0,
+                                      self.numSpectObs / 2.0 - 1,
+                                        num=self.numSpectObs) *\
+                2*np.pi / (self.numSpectObs * self.dt)
+            spectStep = 0
+
+        for step in xrange(N_TIMESTEPS):
+            self.step(printTime=printTime)
+            if (recordEnergy or recordNumber)\
+                    and step % stepsPerObservation == 0:
+                self.times[self.numObservations] = self.time
+                if recordEnergy:
+                    self.energy[self.numObservations] = \
+                        self.getEnergy(normalized=normalized,
+                                       mask=collectionMask)
+                if recordNumber:
+                    self.number[self.numObservations] =\
+                        self.getTotalNumber(mask=collectionMask)
+                self.numObservations += 1
+            if recordSpectrum and step >= self.spectStartStep\
+                    and step <= self.spectEndStep:
+                # Note that we need to copy into the spectrum array in reverse
+                # order. Ie, fill from the bottom up. This is because the omega
+                # axis of the spectrum is reversed.
+                drv.memcpy_dtod(self.spectrum_gpu[- spectStep, :].gpudata,
+                                self.psi[self.N//2, self.N//2 - spectMax:
+                                         self.N//2 + spectMax].gpudata,
+                                self.psi[self.N//2, self.N//2 - spectMax:
+                                         self.N//2 + spectMax].nbytes)
+                spectStep += 1
+
+        # change the gpu spectrum array into a useable one. We can just do a 2d
+        # fft since we recorded the wavefunction rather than the momentum
+        if recordSpectrum:
+            self.spectrum = fft.fftshift(fft.fft2(self.spectrum_gpu.get()))
+
+        if recordEnergy or recordNumber:
+            out = [self.times]
+            if recordEnergy:
+                out.append(self.energy)
+            if recordNumber:
+                out.append(self.number)
+            return out
+
+    def getEnergy(self, normalized=True, mask=None):
+        """
+        Returns the current energy.
+
+        Parameters:
+            normalized: Flag to return the normalized energy (that is, divided
+            by the total density)
+        """
+        if self.gpu:
+            psi = self.psi.get()
+            n = self.n.get()
+        else:
+            psi = self.psi
+            n = self.n
+        density = np.absolute(psi) ** 2
+        gradx = np.gradient(psi)[0]
+        normFactor = density.sum() if normalized else 1.0
+        return np.ma.array(-(0.25 * np.gradient(
+            np.gradient(density)[0])[0]
+            - 0.5 * np.absolute(gradx) ** 2
+            - (self.g_C * density + self.g_R * n)
+            * density), mask=mask).sum() / normFactor
+
+    def getTotalNumber(self, mask=None):
+        """
+        Returns the total number of particles. Performs appropriate scaling on
+        the wavefunction.
+
+        Will be incorrect if a mask is used as it calculates the density and
+        multiplies by the area, and the area of the mask is not taken into
+        account.
+        """
+        densityScaled = self.getDensity(scaled=True, mask=None)
+        area = (2 * self.max_XY_scaled) ** 2
+        return densityScaled.sum() * area
+
+    def getDensity(self, scaled=False, mask=None):
+        """
+        Returns the density, performing scaling if appropriate.
+
+        Parameters:
+            scaled: Flag to scale the density.
+            mask: Collection mask. Density will be incorrect if a mask is used,
+            becuase the area will be incorrect. You can fix this yourself?!
+
+        Returns:
+            The density distribution. If scaled is False, the density will be in
+            units of number / (charL) ** 2. If scaled is True, the density
+            will be in units of number / (micron) ** 2.
+        """
+        psi = self.psi.get() if self.gpu else self.psi
+        if mask:
+            psi = np.ma.array(psi, mask=mask)
+            return np.absolute(psi) * self.charL**(-2) \
+                if scaled else np.absolute(psi)**2
+        else:
+            return np.absolute(psi) * self.charL**(-2) \
+                if scaled else np.absolute(psi)**2
+
+    def save(self, fName, **kwargs):
+        """
+        Saves the relevant parts of the solver as an hdf5 file.
+        The parameters are saved as attributes. They are saved as the parameters
+        that are required to create a new paramatercontainer instance.
+
+        Paramters:
+            f: file name.
+            kwargs: Other attributes to save.
+        """
+        f = h5py.File(fName + ".hdf5", "w")
+        f.create_dataset("psi", data=self.psi.get().astype(np.complex64))
+        f.create_dataset("n", data=self.n.get().astype(np.float32))
+        f.create_dataset("x_ax", data=self.grid.x_axis_scaled.astype(np.float32))
+        f.create_dataset("k_ax", data=self.grid.k_axis_scaled.astype(np.float32))
+        f.create_dataset("Pdt", data=self.Pdt.get().astype(np.float32))
+        if hasattr(self, "energy"):
+            f.create_dataset("energy", data=self.energy.astype(np.float32))
+        if hasattr(self, "number"):
+            f.create_dataset("number", data=self.number.astype(np.float32))
+        if hasattr(self, "times"):
+            f.create_dataset("times", data=self.times.astype(np.float32))
+        if hasattr(self, "spectrum"):
+            f.create_dataset("spectrum", data=self.spectrum.astype(np.complex64))
+            f.create_dataset("omega_axis", data=self.omega_axis.astype(np.float32))
+
+        # paramsToSave = ['R', 'g_C', 'g_R', 'gamma_C', 'gamma_R', 'm', 'charT',
+        #                 'charL']
+        for (param, value) in self.paramContainer.getOutputParams().items():
+            f.attrs[param] = value.magnitude
+        for (attr, value) in kwargs.items():
+            f.attrs[attr] = value
+        f.attrs["t"] = self.time
+        f.close()
+
+class GPESolverSingle(GPESolver)
+    def __init__(self, paramcontainer, dt, grid, pumpfunction=none,
+                 damping='default', psiinitial=none, fftw_method='fftw_patient',
+                 n_threads=6, gpu=true, real_dtype=np.float32,
+                 complex_dtype=np.complex64):
+        GPESolver.__init__(self, paramcontainer, dt, grid, pumpfunction=none,
+                           damping='default', psiinitial=none,
+                           fftw_method='fftw_patient', n_threads=6, gpu=true,
+                           real_dtype=np.float32, complex_dtype=np.complex64):
+
+        hbar = UnitRegistry().hbar.to_base_units().magnitude
+        self.gamma_nl = params['gamma_nl']
+        self.gamma_eff = params['gamma_eff']
+        # Fix the polariton exponential factors and potential
+        expFactorPolFirst = self.dt * (self.g_C - 1j*self.gamma_nl)
+        expFactorPolSecond = self.gamma_eff * self.dt
+        # Note that here we need the unscaled parameters
+        potentialDt = ((hbar * params.g_R)
+                       / (params.charT * params.gamma_R)) * self.Pdt.get()
+        if self.gpu:
+            self.expFactorPolFirst = gpuarray.to_gpu(
+                np.array([expFactorPolFirst]).astype(COMPLEX_DTYPE))
+            self.expFactorPolSecond = gpuarray.to_gpu(
+                np.array([expFactorPolSecond]).astype(COMPLEX_DTYPE))
+            self.expFactorPolThird = gpuarray.to_gpu(
+                np.array([expFactorPolThird]).astype(COMPLEX_DTYPE))
+            self.potentialDt = gpuarray.to_gpu(potentialDt.astype(REAL_DTYPE))
+
+    # TODO: Change step_gpu, energy, paramContainer
+
+    def step_gpu(self):
+        self.cu_fft.fft(self.psi, self.psi, self.plan_forward)
+        self.psi *= self.kineticFactorHalf
+        self.cu_fft.ifft(self.psi, self.psi, self.plan_inverse, scale=True)
+
+        # currentDensity_gpu = abs(psi_gpu) ** 2
+        self.currentDensity = (self.psi * self.psi.conj()).real
+
+        # expFactorExciton_gpu = cumath.exp(-gammaRdt_gpu +
+        #                                   (Rdt_gpu * currentDensity_gpu))
+
+        # # TODO: Don't bother creating the intermediate? Write this as a single
+        # # pycuda elementwise kernel
+        # n_gpu *= cumath.exp(-gammaRdt_gpu + Rdt_gpu * currentDensity_gpu)
+
+        self.psi *= self.exp(
+            self.add(
+                self.add(self.multiply(self.expFactorPolFirst,
+                                       self.currentDensity),
+                         self.potentialDt),
+                self.expFactorPolThird))
+
+        # self.psi *= self.exp(self.expFactorPolFirst * self.n
+        #                      + self.expFactorPolSecond*self.currentDensity
+        #                      + self.expFactorPolThird)
+
+        self.cu_fft.fft(self.psi, self.psi, self.plan_forward)
+        self.psi *= self.kineticFactorHalf
+        self.cu_fft.ifft(self.psi, self.psi, self.plan_inverse, scale=True)
+
+        self.psi *= self.damping
+
+    # TODO: Check
+    def getEnergy(self, normalized=True, mask=None):
+        """
+        Returns the current energy.
+
+        Parameters:
+            normalized: Flag to return the normalized energy (that is, divided
+            by the total density)
+        """
+        if self.gpu:
+            psi = self.psi.get()
+            V = self.potentialDt.get() / self.dt
+        else:
+            psi = self.psi
+            V = self.potentialDt.get() / self.dt
+        density = np.absolute(psi) ** 2
+        gradx = np.gradient(psi)[0]
+        normFactor = density.sum() if normalized else 1.0
+        return np.ma.array(-(0.25 * np.gradient(
+            np.gradient(density)[0])[0]
+            - 0.5 * np.absolute(gradx) ** 2
+            - (self.g_C * density + V)
+            * density), mask=mask).sum() / normFactor
